@@ -17,9 +17,11 @@ from __future__ import annotations
 import collections.abc
 from abc import *
 import inspect
-import operator
+from operator import attrgetter
+from itertools import chain
+import dis
 
-from typing import Generic, TypeVar, Callable
+from typing import Generic, TypeVar, Callable, Iterable
 from typing_extensions import Self
 from types import CellType
 
@@ -100,21 +102,23 @@ class PointerType(ABC, Generic[T]):
 
 	@abstractmethod
 	def __gettarget__(self) -> T:
-		...
+		raise TypeError
 
 	@abstractmethod
 	def __settarget__(self, value: T) -> None:
-		...
+		raise TypeError
 
 	@abstractmethod
 	def __deltarget__(self) -> None:
-		...
+		raise TypeError
 
 	@classmethod
 	def __subclasshook__(cls, C):
 		if cls is PointerType:
 			return collections.abc._check_methods(C, "__gettarget__", "__settarget__", "__deltarget__")
 		return NotImplemented
+
+	starred: ClassVar[bool] = False
 
 class pointer_attr(PointerType[T]):
 	""" Pointer to attribute {obj}.{name}. """
@@ -144,6 +148,21 @@ class pointer_item(PointerType[T]):
 
 	def __deltarget__(self) -> None:
 		del self.obj[self.key]
+
+class pointer_slice(pointer_item[T]):
+	""" Pointer to item {obj}[{slice}]. """
+
+	def __init__(self, obj, *args):
+		""" Slice of given sequence object. """
+		if len(args) == 1:
+			args = (0, args[0])
+		if len(args) == 2:
+			args = (*args, 1)
+		assert len(args) == 3, 'Wrong number of arguments to pointer_slice().'
+		super().__init__(obj, *args)
+
+
+
 
 class pointer_cell(PointerType[T]):
 	""" Pointer to a free variable in the creator's scope.
@@ -229,7 +248,7 @@ class pointer_local(pointer_name[T]):
 	def __new__(cls, name: Callable[[], T] | str) -> pointer_item[T]:
 		return cls.make_with_namespace(name)
 
-	get_namespace = operator.attrgetter('f_locals')
+	get_namespace = attrgetter('f_locals')
 	name_type = 'local'
 	
 class pointer_global(pointer_name[T]):
@@ -238,18 +257,141 @@ class pointer_global(pointer_name[T]):
 	def __new__(cls, name: Callable[[], T] | str) -> pointer_item[T]:
 		return cls.make_with_namespace(name)
 
-	get_namespace = operator.attrgetter('f_globals')
+	get_namespace = attrgetter('f_globals')
 	name_type = 'global'
 	
-class pointer_seq(PointerType[T]):
-	""" A pointer to a sequence (tuple or list) of other pointers.
-	One of them may be the singleton `pointer_star`.
+class pointer_seq(PointerType[Iterable[T]]):
+	""" A pointer to a sequence (tuple or list) of other items, which are pointers.
+
+	Some of them may be pointer_star objects.
+	A pointer with stars cannot be deleted.
+	A pointer with starts can be assigned is there is only one of them.
+
+	Getting the target returns a tuple, or list, of the pointers' targets.
+	Setting the target will accept any iterable of values that has a len().
+	Deleting the target will delete each pointer's target.  Not supported if there is a *ptr.
+
 	"""
+	setter: Callable[Iterable[T], None]
+
+	def __init__(self, *pointers: PointerType[T]):
+		star: int = None
+		next_start: int = 0
+		groups: list[list[PointerType[T]]] = []
+		stars: list[PointerType[T]] = []
+		for pos, ptr in enumerate(pointers):
+			if ptr.starred:
+				groups.append(pointers[next_start : pos])
+				stars.append(ptr)
+				next_start = pos + 1
+		groups.append(pointers[next_start : ])
+
+		if stars:
+			if len(stars) > 1:
+				# Too many stars for setter.
+				def setter(*args):
+					raise TypeError('Cannot set pointer with multiple starred items')
+			else:
+				def setter(value: Iterable[T], min_len = len(pointers) - 1,
+						   heads = list(map(attrgetter('__settarget__'), groups[0])),
+						   head_len = len(groups[0]),
+						   star_setter = stars[0].ptr.__settarget__,
+						   tails = list(map(attrgetter('__settarget__'), groups[1])),
+						   tail_len = len(groups[1]),
+						   ) -> None:
+					vals = list(value)
+					assert len(vals) >= min_len, f'Expected at least {min_len} values to unpack, received {len(vals)}.'
+					any(setter(val) for setter, val in zip(heads, vals[ : head_len]))
+					star_setter(vals[head_len : - tail_len])
+					any(setter(val) for setter, val in zip(tails, vals[- tail_len:]))
+			def deleter():
+				raise TypeError('Cannot delete pointer with any starred items')
+		else:
+			def setter(value: Iterable[T], exact_len = len(pointers) - 1,
+						setters = list(map(attrgetter('__settarget__'), pointers)),
+						len = len(pointers),
+						) -> None:
+				vals = list(value)
+				assert len(vals) == exact_len, f'Expected exactly {exact_len} values to unpack, received {len(vals)}.'
+				any(setter(val) for setter, val in zip(setters, vals))
+			def deleter(
+						deleters = list(map(attrgetter('__deltarget__'), pointers)),
+						) -> None: 
+				any(deleter() for deleter in deleters)
+
+		def groupgetter(group):
+			""" returns Function(no args) -> iterable of targets of group members. """
+			getters = tuple(map(attrgetter('__gettarget__'), group))
+			def getter(getters = getters) -> Iterable[T]:
+				yield from (getter() for getter in getters)
+			return getter
+
+		def itergetters():
+			yield groupgetter(groups[0])
+			for group, star in zip(groups[1:], stars):
+				yield lambda: (star.ptr.__gettarget__())
+				yield groupgetter(group)
+
+		def getter(getters = list(itergetters()), seq = self.seq_type) -> Iterable[T]:
+			return seq(chain(*(getter() for getter in getters)))
+
+		self.getter = getter
+		self.setter = setter
+		self.deleter = deleter
+
+		self.ptrs = list(pointers)
+		self.len = len(pointers)
+
+	def __gettarget__(self) -> T:
+		return self.getter()
+
+	def __settarget__(self, value: Iterable[T]) -> None:
+		self.setter(value)
+
+	def __deltarget__(self) -> None:
+		self.deleter()
+
+	seq_type: ClassVar[Type] = tuple
+
+class pointer_list(pointer_seq[T]):
+
+	seq_type: ClassVar[Type] = list
+
+class pointer_star(PointerType[T]):
+	""" Wraps another pointer and indicates that it is a starred target.
+	"""
+	def __init__(self, pointer: PointerType[T]):
+		self.ptr = pointer
+	
+	def __gettarget__(self) -> T:
+		return NotImplemented
+
+	def __settarget__(self, value: T) -> None:
+		...
+
+	def __deltarget__(self) -> None:
+		...
+
+	starred: ClassVar[bool] = True
 
 # A singleton marker in a sequence of pointers used by pointer_seq.
 # Indicates that the following pointer is starred.
 class _star: pass
-pointer_star = _star()
+star = _star()
+
+p = pointer_list(
+	pointer_global(lambda: a),
+	pointer_star(pointer_global(lambda: b)),
+	pointer_global(lambda: c))
+p.target = range(4)
+print(a, b, c)				# a = 0, b = [1, 2], c = 3
+print(p.target)
+pd = pointer_list(
+	pointer_global(lambda: a),
+	pointer_global(lambda: b),
+	pointer_global(lambda: c))
+del pd.target
+print(list(globals()))
 
 class C: pass
 o = C()

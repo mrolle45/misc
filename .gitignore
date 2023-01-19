@@ -3,3 +3,8 @@
 ################################################################################
 
 /.vs/misc/v16/.suo
+/.vs/misc/v16/Browse.VC.db
+*.json
+*.sqlite
+*.testlog
+/.vs/misc/v16/TestStore/0/testlog.manifest
